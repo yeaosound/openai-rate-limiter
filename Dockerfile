@@ -8,7 +8,10 @@ WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1 
+ENV TARGET_SERVER=https://api.openai.com
+ENV RATE_LIMIT=20
+ENV RATE_LIMIT_WINDOW=60
 
 # 安装系统依赖
 RUN apk add --no-cache gcc musl-dev libffi-dev
@@ -25,9 +28,6 @@ COPY main.py .
 # 暴露端口
 EXPOSE 3280
 
-# 健康检查
-HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:3280/health || exit 1
 
 # 启动应用
 CMD ["python", "main.py"]

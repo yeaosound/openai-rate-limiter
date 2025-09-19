@@ -9,6 +9,11 @@ from urllib.parse import urlparse, urljoin
 from starlette.datastructures import MutableHeaders
 from websockets import connect as websocket_connect  # 新增依赖
 
+# Import rate limiter
+from rate_limiter import RateLimiter, RateLimitMiddleware
+# import exception middleware
+from starlette.middleware.exceptions import ExceptionMiddleware
+
 import logging
 logging.basicConfig(level=logging.INFO)
 
@@ -18,13 +23,16 @@ dotenv.load_dotenv()
 
 
 TARGET_SERVER = os.getenv("TARGET_SERVER", "https://api.openai.com")
-MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4")
-API_KEY = os.getenv("API_KEY", "your_api_key_here")
+RATE_LIMIT = int(os.getenv("RATE_LIMIT", "3"))  # Max requests per window
+RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))  # Window in seconds
 parsed_target = urlparse(TARGET_SERVER)
 TARGET_HOST = parsed_target.netloc
 TARGET_WS_SCHEME = "wss" if parsed_target.scheme == "https" else "ws"  # WebSocket协议
 
-client_session: aiohttp.ClientSession = None
+client_session: aiohttp.ClientSession = aiohttp.ClientSession()
+
+# Initialize rate limiter with configuration from environment variables
+rate_limiter = RateLimiter(max_requests=RATE_LIMIT, window_seconds=RATE_LIMIT_WINDOW)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -53,6 +61,11 @@ async def shutdown():
 app = FastAPI(
     lifespan=lifespan,
 )
+
+# Add rate limiting middleware
+app.add_middleware(RateLimitMiddleware, rate_limiter=rate_limiter)
+# Add exception handling middleware
+app.add_middleware(ExceptionMiddleware, debug=False)
 
 async def pass_ws_request(websocket: WebSocket, path: str):
 
@@ -126,51 +139,14 @@ async def reverse_proxy(request: Request, path: str):
     # 保留原始查询参数
     if request.url.query:
         target_url += f"?{request.url.query}"
-
     # 获取请求体
     body = await request.body()
-    
-    # 如果是POST请求且有body，检查并替换model字段
-    if request.method == "POST" and body:
-        try:
-            # 尝试解析JSON
-            json_data = json.loads(body.decode('utf-8'))
-            # 如果包含model字段，替换为MODEL_NAME
-            if isinstance(json_data, dict) and 'model' in json_data:
-                json_data['model'] = MODEL_NAME
-                body = json.dumps(json_data).encode('utf-8')
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            # 如果解析失败，保持原始body不变
-            pass
-    
-    # 准备请求头 - 使用MutableHeaders
-    headers = MutableHeaders(request.headers)
-    
-    # 移除客户端相关头部
-    if "host" in headers:
-        del headers["host"]
-    
-    # 设置目标服务器信息
-    headers["host"] = TARGET_HOST
-    
-    # 替换Authorization头为API_KEY
-    headers["authorization"] = f"Bearer {API_KEY}"
-
-    if "content-length" in headers:
-        del headers["content-length"]
-    
-    # 转换headers为dict格式
-    request_headers = dict(headers)
-    
-    # 配置超时和连接参数
-    timeout = aiohttp.ClientTimeout(total=300, connect=30, sock_read=300)  # 5分钟超时，适用于长时间流式响应
-
     try:
         # 使用aiohttp发送请求
         response = await client_session.request(
             method=request.method,
             url=target_url,
-            headers=request_headers,
+            headers=MutableHeaders(request.headers),
             data=body if body else None,
         )
                     
