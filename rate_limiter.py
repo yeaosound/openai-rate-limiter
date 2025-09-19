@@ -52,8 +52,12 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self.rate_limiter = rate_limiter or RateLimiter()
 
     async def dispatch(self, request: Request, call_next):
+        # bypass whitelist
         whitelist_paths = ["/health", "/docs", "/openapi.json", "/redoc","favicon.ico"]
         if request.url.path in whitelist_paths:
+            return await call_next(request)
+        # bypass OPTIONS requests for CORS preflight
+        if request.method == "OPTIONS":
             return await call_next(request)
         authorization: str = request.headers.get("Authorization", "")
         if authorization.startswith("Bearer "):
