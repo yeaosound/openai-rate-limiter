@@ -60,6 +60,9 @@ async def shutdown():
 
 app = FastAPI(
     lifespan=lifespan,
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
 )
 
 # Add rate limiting middleware
@@ -142,11 +145,14 @@ async def reverse_proxy(request: Request, path: str):
     # 获取请求体
     body = await request.body()
     try:
+        new_headers = MutableHeaders(request.headers)
+        # 替换Host头
+        new_headers["Host"] = TARGET_HOST
         # 使用aiohttp发送请求
         response = await client_session.request(
             method=request.method,
             url=target_url,
-            headers=MutableHeaders(request.headers),
+            headers=new_headers,
             data=body if body else None,
         )
                     
