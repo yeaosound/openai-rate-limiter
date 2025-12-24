@@ -38,8 +38,8 @@ class RateLimiter:
                 self.requests[identifier] = (tokens - 1, current_time)
                 return True
             else:
-                # Not enough tokens, update last time and reject
-                self.requests[identifier] = (tokens, last_time)
+                # Not enough tokens, update last time to current time so tokens can recover
+                self.requests[identifier] = (tokens, current_time)
                 return False
 
 
@@ -53,7 +53,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next):
         # bypass whitelist
-        whitelist_paths = ["/health", "/docs", "/openapi.json", "/redoc","favicon.ico"]
+        whitelist_paths = ["/health", "/docs", "/openapi.json", "/redoc", "/favicon.ico"]
         if request.url.path in whitelist_paths:
             return await call_next(request)
         # bypass OPTIONS requests for CORS preflight
