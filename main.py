@@ -1,7 +1,4 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, HTTPException, status
-from fastapi.responses import Response, StreamingResponse
-from fastapi.websockets import WebSocket
 import aiohttp
 import os
 import json
@@ -9,30 +6,49 @@ from urllib.parse import urlparse, urljoin
 from starlette.datastructures import MutableHeaders
 from websockets import connect as websocket_connect  # 新增依赖
 
+from fastapi import FastAPI, Request, HTTPException, Response
+from fastapi.responses import Response, StreamingResponse, ORJSONResponse
+from fastapi.websockets import WebSocket
+from http_client import  RequestWrapper, RequestResult, RequestStatus, HttpErrorWithContent, CancelBehavior
+from sse_proxy_client import SseProxyClient
+import orjson
+
 # Import rate limiter
 from rate_limiter import RateLimiter, RateLimitMiddleware
 # import exception middleware
 from starlette.middleware.exceptions import ExceptionMiddleware
 
+import asyncio
+
 import logging
 logging.basicConfig(level=logging.INFO)
-
+logger = logging.getLogger(__name__)
 import dotenv
 dotenv.load_dotenv()
 
 
 
 TARGET_SERVER = os.getenv("TARGET_SERVER", "https://api.openai.com")
-RATE_LIMIT = int(os.getenv("RATE_LIMIT", "3"))  # Max requests per window
+RATE_LIMIT = int(os.getenv("RATE_LIMIT", "30"))  # Max requests per window
 RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))  # Window in seconds
 parsed_target = urlparse(TARGET_SERVER)
 TARGET_HOST = parsed_target.netloc
 TARGET_WS_SCHEME = "wss" if parsed_target.scheme == "https" else "ws"  # WebSocket协议
 
-client_session: aiohttp.ClientSession = aiohttp.ClientSession()
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", 3600))  # 请求超时时间，单位秒
+RETRY_INTERVAL = float(os.getenv("RETRY_INTERVAL", 0.5)) # 重试间隔，单位秒
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", 0))  # 0表示不重试
+LOGGING_LEVEL = os.getenv("LOGGING_LEVEL", "INFO").upper()
+logger.setLevel(getattr(logging, LOGGING_LEVEL, logging.INFO))
+
+client_session: aiohttp.ClientSession = None
+
+proxy_client: SseProxyClient = None
 
 # Initialize rate limiter with configuration from environment variables
 rate_limiter = RateLimiter(max_requests=RATE_LIMIT, window_seconds=RATE_LIMIT_WINDOW)
+
+logger.info(f"Rate Limiter Configured: {RATE_LIMIT} requests per {RATE_LIMIT_WINDOW} seconds")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -46,8 +62,12 @@ async def startup():
     应用启动时，创建 aiohttp.ClientSession 实例。
     """
     global client_session
-    print("Starting up and creating aiohttp.ClientSession...")
+    logger.info("Starting up and creating aiohttp.ClientSession...")
     client_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(connect=10))
+
+    global proxy_client
+    logger.info("Starting up SseProxyClient...")
+    proxy_client = SseProxyClient()
 
 async def shutdown():
     """
@@ -55,8 +75,13 @@ async def shutdown():
     """
     global client_session
     if client_session:
-        print("Shutting down aiohttp.ClientSession...")
+        logger.info("Shutting down aiohttp.ClientSession...")
         await client_session.close()
+
+    global proxy_client
+    if proxy_client:
+        logger.info("Shutting down SseProxyClient...")
+        await proxy_client.close()
 
 app = FastAPI(
     lifespan=lifespan,
@@ -69,6 +94,23 @@ app = FastAPI(
 app.add_middleware(RateLimitMiddleware, rate_limiter=rate_limiter)
 # Add exception handling middleware
 app.add_middleware(ExceptionMiddleware, debug=False)
+@app.exception_handler(HttpErrorWithContent)
+async def upstream_http_exception_handler(request: Request, exc: HttpErrorWithContent):
+    """
+    全局异常捕获：将 AsyncHttpClient 抛出的上游错误转为对应的 HTTP 响应
+    """
+    if exc.content is None:
+        exc.content = b""
+    logger.warning(f"⚠️ Upstream Error {exc.status_code}: {len(exc.content)} bytes")
+    if type(exc.content) == bytes:
+        logger.debug(f"Upstream Error Content: {exc.content.decode(errors='ignore')}")
+    else:
+        logger.debug(f"Upstream Error Content: {exc.content}")
+    return Response(
+        content=exc.content,
+        status_code=exc.status_code,
+        media_type="application/json"
+    )
 
 async def pass_ws_request(websocket: WebSocket, path: str):
 
@@ -114,21 +156,139 @@ async def health_check():
 async def websocket_proxy(websocket: WebSocket, path: str):
     return await pass_ws_request(websocket, path)
 
+async def _check_client_disconnected(response: aiohttp.ClientResponse, raw_request: Request) -> None:
+        """检查客户端是否断开连接"""
+        while response.closed is False:
+            if await raw_request.is_disconnected():
+                logger.warning("Client disconnected, stopping stream")
+                response.close()
+                return
+            await asyncio.sleep(1)  # 每秒检查一次
+        return
 
-async def stream_generator(response: aiohttp.ClientResponse):
+
+async def stream_generator(response: aiohttp.ClientResponse,raw_request:Request):
     try:
+        task = asyncio.create_task(_check_client_disconnected(response, raw_request))
         async for chunk in response.content:
-            logging.debug(f"Received chunk: {chunk}")
+            logger.debug(f"Received chunk: {chunk}")
             if chunk:
                 yield chunk
     except (aiohttp.ClientError, ConnectionError, Exception) as e:
         import traceback
-        logging.error(traceback.format_exc())
+        logger.error(traceback.format_exc())
         # 在流式传输过程中如果连接断开，优雅地结束
-        logging.error(f"Stream connection error: {e}")
+        logger.error(f"Stream connection error: {e}")
+        response.release()
+        task.cancel()
         return
     finally:
+        task.cancel()
         response.release()
+
+async def on_first_chunk_callback(request_id:str, ttft:float, data:None):
+    logger.info(f"First chunk for request {request_id} received in {ttft:.2f} seconds.")
+
+async def on_request_complete_callback(result:RequestResult,data):
+    logger.info(f"Request {result.request_id} completed with status {result.status}.")
+
+async def on_request_error_callback(result:RequestResult,data):
+    logger.error(f"Request {result.request_id} failed with error: {str(result.error)}.")
+
+async def auto_disconnect_connection(raw_request: Request, upstream_request_id: str):
+    """
+    自动断开连接的协程
+    """
+    try:
+        # 监测客户端断开连接
+        while proxy_client.is_alive(upstream_request_id):
+            await asyncio.sleep(1)
+            if await raw_request.is_disconnected():
+                logger.debug(f"Client disconnected, cancelling upstream request {upstream_request_id} if active.")
+                await proxy_client.cancel_request(
+                    upstream_request_id,
+                )
+                return
+    except asyncio.CancelledError:
+        return
+
+@app.post("/v1/chat/completions")
+async def chat_completions(req:dict,request: Request):
+    try:
+        target_url = TARGET_SERVER.rstrip('/') + '/' + request.url.path.lstrip('/')
+        body_bytes = await request.body()
+        try:
+            body = orjson.loads(body_bytes)
+        except orjson.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="Invalid JSON")
+
+        new_headers = MutableHeaders(request.headers)
+        # 替换Host头
+        new_headers["Host"] = TARGET_HOST
+
+        client_wants_stream = body.get("stream", False)
+
+        if client_wants_stream:
+            on_stream_start_callback = on_first_chunk_callback
+        else:
+            on_stream_start_callback = None
+        req_wrapper = RequestWrapper(
+            url=target_url,
+            method="POST",
+            headers=dict(new_headers),
+            json=body,
+            is_stream=True, 
+            keep_content_in_memory=False, 
+            retry_on_stream_error=False,
+            timeout=REQUEST_TIMEOUT,
+            retry_interval=RETRY_INTERVAL,
+            max_retries=MAX_RETRIES,
+            on_stream_start=on_stream_start_callback,
+            on_success=on_request_complete_callback,
+            on_failure=on_request_error_callback,
+            cancel_behavior=CancelBehavior.TRIGGER_SUCCESS
+        )
+
+        # 1. 提交任务
+        req_id = proxy_client.submit(req_wrapper)
+        logger.info(f"Forwarding request {req_id} (Stream: {client_wants_stream})")
+
+        asyncio.create_task(auto_disconnect_connection(request, req_id))
+
+        # 2. 【关键修复】同步等待上游连接建立结果
+        # 如果上游返回 401/400/500，这里会直接抛出 HttpErrorWithContent
+        # 然后被 @app.exception_handler 捕获，返回正确的错误码给客户端
+        await proxy_client.wait_for_upstream_status(req_id)
+
+        # 3. 只有当 wait_for_upstream_status 成功通过（即 Status 200），才建立流式响应
+        if client_wants_stream:
+            return StreamingResponse(
+                proxy_client.stream_generator(
+                    req_id 
+                ),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no"
+                }
+            )
+        else:
+            async def collect_response():
+                chunks = []
+                async for chunk in proxy_client.stream_generator(req_id):
+                    chunks.append(chunk)
+                return b"".join(chunks)
+            
+            full_body = await collect_response()
+            return Response(content=full_body, media_type="application/json")
+
+    except HttpErrorWithContent:
+        # 显式抛出以触发 handler
+        raise
+    except Exception as e:
+        logger.error(f"Proxy Internal Error: {str(e)}")
+        return ORJSONResponse(content={"error": str(e)}, status_code=500)
 
 
 @app.api_route("/{path:path}", methods=[
@@ -161,7 +321,7 @@ async def reverse_proxy(request: Request, path: str):
             response.raise_for_status()
             # 流式响应
             return StreamingResponse(
-                stream_generator(response),
+                stream_generator(response,raw_request=request),
                 media_type='text/event-stream'
             )
         else:
