@@ -118,7 +118,9 @@ class AsyncHttpClient:
     async def get_session(self) -> aiohttp.ClientSession:
         if self.session is None or self.session.closed:
             # 不设置 json_serialize，我们在 _worker 中手动用 orjson
-            self.session = aiohttp.ClientSession()
+            # 移除所有并发限制
+            connector = aiohttp.TCPConnector(limit=0, limit_per_host=0)
+            self.session = aiohttp.ClientSession(connector=connector)
         return self.session
 
     def submit(self, request: RequestWrapper) -> str:

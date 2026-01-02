@@ -63,7 +63,12 @@ async def startup():
     """
     global client_session
     logger.info("Starting up and creating aiohttp.ClientSession...")
-    client_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(connect=10))
+    # 移除所有并发限制
+    connector = aiohttp.TCPConnector(limit=0, limit_per_host=0)
+    client_session = aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(connect=10),
+        connector=connector
+    )
 
     global proxy_client
     logger.info("Starting up SseProxyClient...")
